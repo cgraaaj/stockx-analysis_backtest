@@ -1,0 +1,11 @@
+# Core
+httpx>=0.24
+pandas>=2.0
+openpyxl>=3.1
+python-dotenv>=1.0
+aiohttp>=3.9
+
+# Database (used by analysis module's DatabaseService)
+databases>=0.9
+SQLAlchemy>=2.0
+psycopg2-binary>=2.9
