@@ -33,3 +33,4 @@ memory/
 
 # Misc
 bottomline.txt
+*.pickle
