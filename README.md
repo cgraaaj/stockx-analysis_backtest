@@ -1,4 +1,4 @@
-# STOCKX Analysis & Backtest
+# StockX Analysis & Backtest
 
 ---
 
