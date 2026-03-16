@@ -1,5 +1,10 @@
-"""Phase 1: OI Analysis + Ranking + Market Context tagging."""
+"""Phase 1: OI Analysis + Ranking + Market Context tagging.
 
+Optimised with concurrent async API calls — tick sub-batches and stock
+batches are fetched in parallel via asyncio.gather.
+"""
+
+import asyncio
 import json
 import logging
 import pickle
@@ -28,6 +33,30 @@ from src.backtest.data import tickerflow as tf
 logger = logging.getLogger("Phase1")
 
 
+async def _fetch_batch_ticks(
+    seqs: list[int], trade_date: str, tick_sub_size: int = 20,
+) -> list[pd.DataFrame]:
+    """Fetch all tick sub-batches for a stock batch concurrently."""
+    tasks = []
+    for ti in range(0, len(seqs), tick_sub_size):
+        sub_seqs = seqs[ti : ti + tick_sub_size]
+        tasks.append(
+            tf.aget_ticks_batch(
+                instrument_ids=sub_seqs,
+                start=f"{trade_date} {trading_config.MARKET_START_TIME}",
+                end=f"{trade_date} {trading_config.MARKET_END_TIME}",
+            )
+        )
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    frames = []
+    for r in results:
+        if isinstance(r, Exception):
+            logger.warning(f"  Ticks sub-batch failed: {r}")
+        elif not r.empty:
+            frames.append(r)
+    return frames
+
+
 async def run(config: BacktestConfig, run_dir, *, predictions=None):
     """Execute Phase 1 and return (all_results, predictions, market_ctx_log).
 
@@ -46,7 +75,7 @@ async def run(config: BacktestConfig, run_dir, *, predictions=None):
 
     logger.info(f"TickerFlow API: {tf._BASE_URL}")
 
-    raw_stocks = tf.get_stocks()
+    raw_stocks = await tf.aget_stocks()
     stocks = [
         Stock(
             id=str(s["id"]),
@@ -57,7 +86,7 @@ async def run(config: BacktestConfig, run_dir, *, predictions=None):
         )
         for s in raw_stocks
     ]
-    expiry_dates = tf.get_expiries()
+    expiry_dates = await tf.aget_expiries()
     logger.info(f"Loaded {len(stocks)} stocks, {len(expiry_dates)} expiry dates")
 
     all_results = []
@@ -82,36 +111,54 @@ async def run(config: BacktestConfig, run_dir, *, predictions=None):
 
         batch_size = config.batch_size
         date_results = []
+
+        # --- Fetch instrument batches concurrently (all batches per date) ---
+        batch_groups = []
         for i in range(0, len(stocks), batch_size):
             batch = stocks[i : i + batch_size]
-            batch_num = i // batch_size + 1
-            total_batches = (len(stocks) - 1) // batch_size + 1
-
             stock_ids = [s.id for s in batch]
-            try:
-                instrument_df = tf.get_instruments_batch(stock_ids=stock_ids, expiry=expiry)
-            except Exception as e:
-                logger.warning(f"  Instruments batch failed ({len(stock_ids)} ids): {e}")
+            batch_groups.append((batch, stock_ids))
+
+        inst_tasks = [
+            tf.aget_instruments_batch(stock_ids=ids, expiry=expiry)
+            for _, ids in batch_groups
+        ]
+        inst_results = await asyncio.gather(*inst_tasks, return_exceptions=True)
+
+        # --- For each batch that got instruments, fetch ticks concurrently ---
+        tick_tasks = []
+        tick_task_indices = []
+        for idx, (inst_res, (batch, _)) in enumerate(zip(inst_results, batch_groups)):
+            if isinstance(inst_res, Exception):
+                logger.warning(f"  Instruments batch failed: {inst_res}")
                 continue
-            if instrument_df.empty:
-                logger.info(f"  Batch {batch_num}/{total_batches}: no instruments")
+            if inst_res.empty:
+                continue
+            seqs = inst_res["instrument_seq"].dropna().astype(int).tolist()
+            if not seqs:
+                continue
+            tick_tasks.append(_fetch_batch_ticks(seqs, trade_date))
+            tick_task_indices.append(idx)
+
+        tick_results = await asyncio.gather(*tick_tasks, return_exceptions=True)
+
+        # --- Analyze stocks with fetched data ---
+        tick_map: dict[int, list[pd.DataFrame]] = {}
+        for task_pos, batch_idx in enumerate(tick_task_indices):
+            res = tick_results[task_pos]
+            if isinstance(res, Exception):
+                logger.warning(f"  Tick fetch failed for batch {batch_idx}: {res}")
+                continue
+            tick_map[batch_idx] = res
+
+        for idx, (batch, _) in enumerate(batch_groups):
+            batch_num = idx + 1
+            total_batches = len(batch_groups)
+            instrument_df = inst_results[idx]
+            if isinstance(instrument_df, Exception) or instrument_df.empty:
                 continue
 
-            seqs = instrument_df["instrument_seq"].dropna().astype(int).tolist()
-            tick_frames = []
-            tick_sub_size = 20
-            for ti in range(0, len(seqs), tick_sub_size):
-                sub_seqs = seqs[ti : ti + tick_sub_size]
-                try:
-                    sub_df = tf.get_ticks_batch(
-                        instrument_ids=sub_seqs,
-                        start=f"{trade_date} {trading_config.MARKET_START_TIME}",
-                        end=f"{trade_date} {trading_config.MARKET_END_TIME}",
-                    )
-                    if not sub_df.empty:
-                        tick_frames.append(sub_df)
-                except Exception as e:
-                    logger.warning(f"  Ticks sub-batch failed ({len(sub_seqs)} seqs): {e}")
+            tick_frames = tick_map.get(idx, [])
             if not tick_frames:
                 logger.info(f"  Batch {batch_num}/{total_batches}: no ticker data")
                 continue

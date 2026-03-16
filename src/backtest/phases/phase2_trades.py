@@ -35,25 +35,27 @@ def load_predictions(pred_file: Path) -> list[StockPrediction]:
         if df.empty:
             continue
 
-        for _, row in df.iterrows():
-            date = pd.to_datetime(row["Date"])
-            time_str = str(row["Time"])
+        for row in df.itertuples(index=False):
+            date = pd.to_datetime(row.Date)
+            time_str = str(row.Time)
             ts_parts = time_str.split(":")
             signal_ts = datetime(
                 date.year, date.month, date.day,
                 int(ts_parts[0]), int(ts_parts[1]),
                 int(ts_parts[2]) if len(ts_parts) > 2 else 0,
             )
+            market_trend = getattr(row, "Market_Trend", "") or None
+            trend_alignment = getattr(row, "Trend_Alignment", "") or None
             preds.append(StockPrediction(
-                stock=row["Stock"],
+                stock=row.Stock,
                 timestamp=signal_ts,
-                grade=row["Grade"],
+                grade=row.Grade,
                 option_type=opt_type,
-                tn_ratio=int(row["TN_Ratio"]),
-                bullish_count=int(row["Bullish_Count"]),
-                bearish_count=int(row["Bearish_Count"]),
-                market_trend=row.get("Market_Trend", "") or None,
-                trend_alignment=row.get("Trend_Alignment", "") or None,
+                tn_ratio=int(row.TN_Ratio),
+                bullish_count=int(row.Bullish_Count),
+                bearish_count=int(row.Bearish_Count),
+                market_trend=market_trend,
+                trend_alignment=trend_alignment,
             ))
     return preds
 
@@ -135,7 +137,7 @@ async def run(config: BacktestConfig, run_dir: Path, *, predictions_file: Path |
         return []
     logger.info(f"Loaded {len(preds)} predictions from {predictions_file.name}")
 
-    key_map = tf.get_stock_key_map()
+    key_map = await tf.aget_stock_key_map()
     logger.info(f"Loaded {len(key_map)} instrument key mappings")
 
     pairs = set()

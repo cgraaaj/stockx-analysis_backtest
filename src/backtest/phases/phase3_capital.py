@@ -2,8 +2,12 @@
 
 Filters Phase 2 trades to accepted grades, applies RSI filter,
 then simulates with a compounding portfolio (concurrent position tracking).
+
+Optimised: pre-fetches all instrument + tick data concurrently before
+the sequential capital simulation loop.
 """
 
+import asyncio
 import csv
 import json
 import logging
@@ -36,7 +40,77 @@ def _load_phase2_trades(run_dir: Path) -> list[dict]:
     return data["trades"]
 
 
-def run(config: BacktestConfig, run_dir: Path, *, phase2_trades: list[dict] | None = None):
+async def _prefetch_grade_data(
+    trades: list[dict],
+    accepted_grades: list[str],
+    expiry_dates: list[str],
+) -> tuple[list[dict], int]:
+    """Concurrently fetch instrument + tick data for grade-filtered trades.
+
+    Returns (prepared_list, skipped_count).
+    """
+
+    async def _fetch_one(trade: dict):
+        grade = trade.get("grade", "D")
+        if grade not in accepted_grades:
+            return None
+        stock = trade["stock"]
+        opt_type = trade["option_type"]
+        signal_time = datetime.strptime(trade["signal_time"], "%Y-%m-%d %H:%M:%S")
+        trade_date = signal_time.strftime("%Y-%m-%d")
+        spot_price = trade["entry_price"]
+        expiry = pick_expiry(trade_date, expiry_dates)
+
+        inst = await tf.afind_atm_instrument(stock, opt_type, spot_price, expiry)
+        if inst is None:
+            return "skip"
+        candles = await tf.aget_ticks(
+            instrument_id=inst["instrument_seq"],
+            start=f"{trade_date}T09:15:00",
+            end=f"{trade_date}T15:30:00",
+        )
+        if candles.empty:
+            return "skip"
+        rsi_val = get_premium_rsi_at_signal(candles, signal_time, 14)
+        return {
+            "stock": stock,
+            "option_type": opt_type,
+            "trade_date": trade_date,
+            "signal_time": signal_time,
+            "spot_price": spot_price,
+            "lot_size": inst["lot_size"],
+            "strike_price": inst["strike_price"],
+            "trading_symbol": inst["trading_symbol"],
+            "expiry": expiry,
+            "candles": candles,
+            "rsi": rsi_val,
+            "grade": grade,
+            "market_trend": trade.get("market_trend", ""),
+            "trend_alignment": trade.get("trend_alignment", ""),
+        }
+
+    results = await asyncio.gather(
+        *[_fetch_one(t) for t in trades], return_exceptions=True,
+    )
+
+    prepared = []
+    skipped = 0
+    for r in results:
+        if isinstance(r, Exception):
+            logger.warning(f"  Prefetch error: {r}")
+            skipped += 1
+        elif r is None:
+            pass  # grade-filtered out
+        elif r == "skip":
+            skipped += 1
+        else:
+            prepared.append(r)
+
+    prepared.sort(key=lambda t: t["signal_time"])
+    return prepared, skipped
+
+
+async def run(config: BacktestConfig, run_dir: Path, *, phase2_trades: list[dict] | None = None):
     """Execute Phase 3b and return the trade rows list.
 
     If *phase2_trades* is provided (in-memory from pipeline), use it
@@ -68,59 +142,17 @@ def run(config: BacktestConfig, run_dir: Path, *, phase2_trades: list[dict] | No
     logger.info(f"SL / Target     = {sl_pct}% / {target_pct}%")
     logger.info(f"Entry offset    = {entry_offset} candles")
 
-    expiry_dates = tf.get_expiries()
+    expiry_dates = await tf.aget_expiries()
 
-    # -- Fetch + filter to accepted grades --
-    logger.info("Fetching data via TickerFlow API...")
-    prepared = []
-    skipped = 0
-
-    for trade in phase2_trades:
-        grade = trade.get("grade", "D")
-        if grade not in accepted_grades:
-            continue
-
-        stock = trade["stock"]
-        opt_type = trade["option_type"]
-        signal_time = datetime.strptime(trade["signal_time"], "%Y-%m-%d %H:%M:%S")
-        trade_date = signal_time.strftime("%Y-%m-%d")
-        spot_price = trade["entry_price"]
-        expiry = pick_expiry(trade_date, expiry_dates)
-
-        inst = tf.find_atm_instrument(stock, opt_type, spot_price, expiry)
-        if inst is None:
-            skipped += 1
-            continue
-
-        candles = tf.get_ticks(
-            instrument_id=inst["instrument_seq"],
-            start=f"{trade_date}T09:15:00",
-            end=f"{trade_date}T15:30:00",
-        )
-        if candles.empty:
-            skipped += 1
-            continue
-
-        rsi_val = get_premium_rsi_at_signal(candles, signal_time, 14)
-
-        prepared.append({
-            "stock": stock,
-            "option_type": opt_type,
-            "trade_date": trade_date,
-            "signal_time": signal_time,
-            "spot_price": spot_price,
-            "lot_size": inst["lot_size"],
-            "strike_price": inst["strike_price"],
-            "trading_symbol": inst["trading_symbol"],
-            "expiry": expiry,
-            "candles": candles,
-            "rsi": rsi_val,
-            "grade": grade,
-            "market_trend": trade.get("market_trend", ""),
-            "trend_alignment": trade.get("trend_alignment", ""),
-        })
-
-    prepared.sort(key=lambda t: t["signal_time"])
+    logger.info("Prefetching instrument + tick data concurrently...")
+    prefetch_start = time.time()
+    prepared, skipped = await _prefetch_grade_data(
+        phase2_trades, accepted_grades, expiry_dates,
+    )
+    logger.info(
+        f"Prefetch done: {len(prepared)} trades, skipped {skipped} "
+        f"in {time.time() - prefetch_start:.1f}s"
+    )
     logger.info(f"Grade {accepted_grades} trades: {len(prepared)} (skipped {skipped})")
 
     # -- Compounding capital simulation --

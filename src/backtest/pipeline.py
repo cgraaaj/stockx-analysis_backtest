@@ -137,16 +137,19 @@ async def run_pipeline(
     if "3a" in phase_list:
         from src.backtest.phases.phase3_fno import run as run_p3a
 
-        ctx.phase3a_results = run_p3a(
+        ctx.phase3a_results = await run_p3a(
             config, run_dir, phase2_trades=ctx.phase2_trades
         )
 
     if "3b" in phase_list:
         from src.backtest.phases.phase3_capital import run as run_p3b
 
-        ctx.phase3b_results = run_p3b(
+        ctx.phase3b_results = await run_p3b(
             config, run_dir, phase2_trades=ctx.phase2_trades
         )
+
+    from src.backtest.data.tickerflow import close_async_client
+    await close_async_client()
 
     logger.info("=" * 60)
     logger.info("PIPELINE COMPLETE")

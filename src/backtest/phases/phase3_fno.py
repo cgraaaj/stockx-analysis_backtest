@@ -2,9 +2,12 @@
 
 Simulates option buying (CE for calls, PE for puts) with fixed
 capital per trade.  Uses ATM strike premiums via TickerFlow API.
-All grades included — pure signal quality metric.
+
+Optimised: pre-fetches all instrument + tick data concurrently before
+running the sequential simulation loop.
 """
 
+import asyncio
 import json
 import logging
 import math
@@ -36,7 +39,48 @@ def _load_phase2_trades(run_dir: Path) -> list[dict]:
     return data["trades"]
 
 
-def run(config: BacktestConfig, run_dir: Path, *, phase2_trades: list[dict] | None = None):
+async def _prefetch_trade_data(
+    trades: list[dict], expiry_dates: list[str],
+) -> dict[int, dict]:
+    """Concurrently fetch ATM instrument + tick data for all trades.
+
+    Returns {trade_index: {"inst": ..., "candles": DataFrame}} for trades
+    that have valid data.
+    """
+
+    async def _fetch_one(idx: int, trade: dict):
+        signal_time = datetime.strptime(trade["signal_time"], "%Y-%m-%d %H:%M:%S")
+        trade_date = signal_time.strftime("%Y-%m-%d")
+        expiry = pick_expiry(trade_date, expiry_dates)
+        inst = await tf.afind_atm_instrument(
+            trade["stock"], trade["option_type"], trade["entry_price"], expiry,
+        )
+        if inst is None:
+            return idx, None
+        candles = await tf.aget_ticks(
+            instrument_id=inst["instrument_seq"],
+            start=f"{trade_date}T09:15:00",
+            end=f"{trade_date}T15:30:00",
+        )
+        if candles.empty:
+            return idx, None
+        return idx, {"inst": inst, "candles": candles}
+
+    tasks = [_fetch_one(i, t) for i, t in enumerate(trades)]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    data_map: dict[int, dict] = {}
+    for item in results:
+        if isinstance(item, Exception):
+            logger.warning(f"  Prefetch error: {item}")
+            continue
+        idx, data = item
+        if data is not None:
+            data_map[idx] = data
+    return data_map
+
+
+async def run(config: BacktestConfig, run_dir: Path, *, phase2_trades: list[dict] | None = None):
     """Execute Phase 3a and return the results list.
 
     If *phase2_trades* is provided (in-memory from pipeline), use it
@@ -68,13 +112,21 @@ def run(config: BacktestConfig, run_dir: Path, *, phase2_trades: list[dict] | No
     logger.info(f"Entry mode      = {entry_mode}")
     logger.info(f"Trades loaded   = {len(phase2_trades)}")
 
-    expiry_dates = tf.get_expiries()
+    expiry_dates = await tf.aget_expiries()
+
+    logger.info("Prefetching instrument + tick data concurrently...")
+    prefetch_start = time.time()
+    trade_data = await _prefetch_trade_data(phase2_trades, expiry_dates)
+    logger.info(
+        f"Prefetch done: {len(trade_data)}/{len(phase2_trades)} trades "
+        f"in {time.time() - prefetch_start:.1f}s"
+    )
 
     results = []
     skipped = 0
     total_capital_deployed = 0
 
-    for trade in phase2_trades:
+    for trade_idx, trade in enumerate(phase2_trades):
         stock = trade["stock"]
         opt_type = trade["option_type"]
         signal_time_str = trade["signal_time"]
@@ -82,23 +134,12 @@ def run(config: BacktestConfig, run_dir: Path, *, phase2_trades: list[dict] | No
         trade_date = signal_time.strftime("%Y-%m-%d")
         spot_price = trade["entry_price"]
 
-        expiry = pick_expiry(trade_date, expiry_dates)
-
-        inst = tf.find_atm_instrument(stock, opt_type, spot_price, expiry)
-        if inst is None:
-            logger.warning(f"  {stock} ({trade_date}): no ATM instrument")
+        fetched = trade_data.get(trade_idx)
+        if fetched is None:
             skipped += 1
             continue
-
-        candles = tf.get_ticks(
-            instrument_id=inst["instrument_seq"],
-            start=f"{trade_date}T09:15:00",
-            end=f"{trade_date}T15:30:00",
-        )
-        if candles.empty:
-            logger.warning(f"  {stock} ({trade_date}): no premium candles")
-            skipped += 1
-            continue
+        inst = fetched["inst"]
+        candles = fetched["candles"]
 
         premium_rsi = get_premium_rsi_at_signal(candles, signal_time, 14)
 

@@ -64,38 +64,60 @@ async def fetch_stock_candles_raw(
     return pd.DataFrame()
 
 
+_UPSTOX_SEMAPHORE = asyncio.Semaphore(10)
+
+
+async def _fetch_single(
+    session: aiohttp.ClientSession,
+    ikey: str,
+    date: str,
+    stock: str,
+) -> tuple[str, dict | None]:
+    """Fetch + resample one (stock, date) pair with concurrency throttle."""
+    async with _UPSTOX_SEMAPHORE:
+        raw_1m = await fetch_stock_candles_raw(session, ikey, date, stock)
+    if raw_1m.empty:
+        logger.warning(f"  {stock} ({date}): no candles")
+        return f"{stock}_{date}", None
+    resampled_5m = resample_to_5min(raw_1m)
+    logger.info(f"  {stock} ({date}): {len(raw_1m)} 1m -> {len(resampled_5m)} 5m candles")
+    return f"{stock}_{date}", {"raw_1m": raw_1m, "ohlc_5m": resampled_5m}
+
+
 async def fetch_all_candles(
     stock_date_pairs: set[tuple[str, str]],
     key_map: dict[str, str],
 ) -> dict[str, dict]:
-    """Fetch 1-min candles and return both raw and 5-min resampled per (stock, date).
-    
+    """Fetch 1-min candles concurrently and return both raw and 5-min resampled.
+
+    Uses asyncio.gather with a semaphore (10 concurrent) to stay within
+    Upstox rate limits while dramatically cutting wall-clock time.
+
     Args:
         stock_date_pairs: set of (stock_name, date_str) tuples
         key_map: {stock_name: instrument_key}
-    
+
     Returns:
         dict keyed by "{stock}_{date}" with {"raw_1m": df, "ohlc_5m": df}
     """
     result: dict[str, dict] = {}
 
     async with aiohttp.ClientSession() as session:
+        tasks = []
         for stock, date in stock_date_pairs:
             ikey = key_map.get(stock)
             if not ikey:
                 logger.warning(f"No instrument_key for {stock}")
                 continue
+            tasks.append(_fetch_single(session, ikey, date, stock))
 
-            raw_1m = await fetch_stock_candles_raw(session, ikey, date, stock)
-            if not raw_1m.empty:
-                resampled_5m = resample_to_5min(raw_1m)
-                lookup_key = f"{stock}_{date}"
-                result[lookup_key] = {
-                    "raw_1m": raw_1m,
-                    "ohlc_5m": resampled_5m,
-                }
-                logger.info(f"  {stock} ({date}): {len(raw_1m)} 1m -> {len(resampled_5m)} 5m candles")
-            else:
-                logger.warning(f"  {stock} ({date}): no candles")
+        completed = await asyncio.gather(*tasks, return_exceptions=True)
+        for item in completed:
+            if isinstance(item, Exception):
+                logger.error(f"  Candle fetch error: {item}")
+                continue
+            key, data = item
+            if data is not None:
+                result[key] = data
 
     return result

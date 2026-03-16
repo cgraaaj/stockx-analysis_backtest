@@ -57,11 +57,11 @@ def analyze_stock(stock, instrument_df, ticker_df, trade_date, analysis_svc):
     timestamps = get_trading_timestamps(trade_date)
 
     processed = []
-    for _, row in pairs_df.iterrows():
+    for row in pairs_df.itertuples(index=False):
         pair = CEPEPair(
-            ce_seq=int(row["ce_seq"]) if pd.notna(row.get("ce_seq")) else None,
-            pe_seq=int(row["pe_seq"]) if pd.notna(row.get("pe_seq")) else None,
-            strike_price=row["strike_price"],
+            ce_seq=int(row.ce_seq) if pd.notna(row.ce_seq) else None,
+            pe_seq=int(row.pe_seq) if pd.notna(row.pe_seq) else None,
+            strike_price=row.strike_price,
         )
         df = analysis_svc.process_ce_pe_pair(stock_ticks, pair, trade_date, timestamps)
         if not df.empty:
