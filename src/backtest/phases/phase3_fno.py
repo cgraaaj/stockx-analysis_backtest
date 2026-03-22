@@ -42,21 +42,43 @@ def _load_phase2_trades(run_dir: Path) -> list[dict]:
 async def _prefetch_trade_data(
     trades: list[dict], expiry_dates: list[str],
 ) -> dict[int, dict]:
-    """Concurrently fetch ATM instrument + tick data for all trades.
+    """Bulk-fetch ATM instruments in one call, then fetch ticks concurrently.
 
     Returns {trade_index: {"inst": ..., "candles": DataFrame}} for trades
     that have valid data.
     """
-
-    async def _fetch_one(idx: int, trade: dict):
+    # --- Step 1: Group trades by expiry and do one bulk ATM call per group ---
+    expiry_groups: dict[str, list[dict]] = {}
+    for idx, trade in enumerate(trades):
         signal_time = datetime.strptime(trade["signal_time"], "%Y-%m-%d %H:%M:%S")
         trade_date = signal_time.strftime("%Y-%m-%d")
         expiry = pick_expiry(trade_date, expiry_dates)
-        inst = await tf.afind_atm_instrument(
-            trade["stock"], trade["option_type"], trade["entry_price"], expiry,
-        )
-        if inst is None:
-            return idx, None
+        expiry_groups.setdefault(expiry, []).append({
+            "idx": idx,
+            "stock_name": trade["stock"],
+            "option_type": trade["option_type"],
+            "spot_price": trade["entry_price"],
+        })
+
+    bulk_tasks = [
+        tf.aget_atm_instruments_bulk(reqs, expiry=exp)
+        for exp, reqs in expiry_groups.items()
+    ]
+    bulk_results = await asyncio.gather(*bulk_tasks, return_exceptions=True)
+
+    inst_map: dict[int, dict] = {}
+    for res in bulk_results:
+        if isinstance(res, Exception):
+            logger.warning(f"  Bulk ATM error: {res}")
+            continue
+        inst_map.update(res)
+
+    logger.info(f"  Bulk ATM resolved {len(inst_map)}/{len(trades)} instruments")
+
+    # --- Step 2: Fetch tick data concurrently for resolved instruments ---
+    async def _fetch_ticks(idx: int, inst: dict, trade: dict):
+        signal_time = datetime.strptime(trade["signal_time"], "%Y-%m-%d %H:%M:%S")
+        trade_date = signal_time.strftime("%Y-%m-%d")
         candles = await tf.aget_ticks(
             instrument_id=inst["instrument_seq"],
             start=f"{trade_date}T09:15:00",
@@ -66,13 +88,16 @@ async def _prefetch_trade_data(
             return idx, None
         return idx, {"inst": inst, "candles": candles}
 
-    tasks = [_fetch_one(i, t) for i, t in enumerate(trades)]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+    tick_tasks = [
+        _fetch_ticks(idx, inst_map[idx], trades[idx])
+        for idx in inst_map
+    ]
+    tick_results = await asyncio.gather(*tick_tasks, return_exceptions=True)
 
     data_map: dict[int, dict] = {}
-    for item in results:
+    for item in tick_results:
         if isinstance(item, Exception):
-            logger.warning(f"  Prefetch error: {item}")
+            logger.warning(f"  Tick prefetch error: {item}")
             continue
         idx, data = item
         if data is not None:

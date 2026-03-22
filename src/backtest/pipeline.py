@@ -7,6 +7,7 @@ when phases run together, or loading from disk for standalone runs.
 import asyncio
 import json
 import logging
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -90,6 +91,7 @@ async def run_pipeline(
         results_dir: Existing run dir to resume from (for phases 2/3)
     """
     apply_to_globals(config)
+    pipeline_start = time.monotonic()
 
     phase_list = _parse_phases(phases)
 
@@ -151,9 +153,13 @@ async def run_pipeline(
     from src.backtest.data.tickerflow import close_async_client
     await close_async_client()
 
+    elapsed_s = time.monotonic() - pipeline_start
     logger.info("=" * 60)
     logger.info("PIPELINE COMPLETE")
     logger.info(f"Results in: {run_dir}")
+    logger.info(
+        f"Total pipeline wall time: {elapsed_s / 60:.1f} min ({elapsed_s:.0f} s)"
+    )
     logger.info("=" * 60)
 
     return ctx

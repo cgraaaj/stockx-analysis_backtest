@@ -45,67 +45,96 @@ async def _prefetch_grade_data(
     accepted_grades: list[str],
     expiry_dates: list[str],
 ) -> tuple[list[dict], int]:
-    """Concurrently fetch instrument + tick data for grade-filtered trades.
+    """Bulk-fetch ATM instruments, then fetch ticks concurrently.
 
     Returns (prepared_list, skipped_count).
     """
+    # --- Step 1: Grade-filter and group by expiry for bulk ATM lookup ---
+    eligible: list[tuple[int, dict]] = []
+    for idx, trade in enumerate(trades):
+        if trade.get("grade", "D") in accepted_grades:
+            eligible.append((idx, trade))
 
-    async def _fetch_one(trade: dict):
-        grade = trade.get("grade", "D")
-        if grade not in accepted_grades:
-            return None
-        stock = trade["stock"]
-        opt_type = trade["option_type"]
+    expiry_groups: dict[str, list[dict]] = {}
+    trade_meta: dict[int, dict] = {}
+    for idx, trade in eligible:
         signal_time = datetime.strptime(trade["signal_time"], "%Y-%m-%d %H:%M:%S")
         trade_date = signal_time.strftime("%Y-%m-%d")
-        spot_price = trade["entry_price"]
         expiry = pick_expiry(trade_date, expiry_dates)
+        expiry_groups.setdefault(expiry, []).append({
+            "idx": idx,
+            "stock_name": trade["stock"],
+            "option_type": trade["option_type"],
+            "spot_price": trade["entry_price"],
+        })
+        trade_meta[idx] = {
+            "trade": trade, "signal_time": signal_time,
+            "trade_date": trade_date, "expiry": expiry,
+        }
 
-        inst = await tf.afind_atm_instrument(stock, opt_type, spot_price, expiry)
-        if inst is None:
-            return "skip"
+    bulk_tasks = [
+        tf.aget_atm_instruments_bulk(reqs, expiry=exp)
+        for exp, reqs in expiry_groups.items()
+    ]
+    bulk_results = await asyncio.gather(*bulk_tasks, return_exceptions=True)
+
+    inst_map: dict[int, dict] = {}
+    for res in bulk_results:
+        if isinstance(res, Exception):
+            logger.warning(f"  Bulk ATM error: {res}")
+            continue
+        inst_map.update(res)
+
+    logger.info(f"  Bulk ATM resolved {len(inst_map)}/{len(eligible)} instruments")
+
+    # --- Step 2: Fetch tick data concurrently for resolved instruments ---
+    async def _fetch_ticks(idx: int):
+        meta = trade_meta[idx]
+        inst = inst_map[idx]
+        td = meta["trade_date"]
         candles = await tf.aget_ticks(
             instrument_id=inst["instrument_seq"],
-            start=f"{trade_date}T09:15:00",
-            end=f"{trade_date}T15:30:00",
+            start=f"{td}T09:15:00", end=f"{td}T15:30:00",
         )
         if candles.empty:
-            return "skip"
-        rsi_val = get_premium_rsi_at_signal(candles, signal_time, 14)
-        return {
-            "stock": stock,
-            "option_type": opt_type,
-            "trade_date": trade_date,
-            "signal_time": signal_time,
-            "spot_price": spot_price,
+            return idx, None
+        trade = meta["trade"]
+        rsi_val = get_premium_rsi_at_signal(candles, meta["signal_time"], 14)
+        return idx, {
+            "stock": trade["stock"],
+            "option_type": trade["option_type"],
+            "trade_date": td,
+            "signal_time": meta["signal_time"],
+            "spot_price": trade["entry_price"],
             "lot_size": inst["lot_size"],
             "strike_price": inst["strike_price"],
             "trading_symbol": inst["trading_symbol"],
-            "expiry": expiry,
+            "expiry": meta["expiry"],
             "candles": candles,
             "rsi": rsi_val,
-            "grade": grade,
+            "grade": trade.get("grade", "D"),
             "market_trend": trade.get("market_trend", ""),
             "trend_alignment": trade.get("trend_alignment", ""),
         }
 
-    results = await asyncio.gather(
-        *[_fetch_one(t) for t in trades], return_exceptions=True,
+    tick_results = await asyncio.gather(
+        *[_fetch_ticks(idx) for idx in inst_map], return_exceptions=True,
     )
 
     prepared = []
     skipped = 0
-    for r in results:
+    for r in tick_results:
         if isinstance(r, Exception):
             logger.warning(f"  Prefetch error: {r}")
             skipped += 1
-        elif r is None:
-            pass  # grade-filtered out
-        elif r == "skip":
+            continue
+        idx, data = r
+        if data is None:
             skipped += 1
         else:
-            prepared.append(r)
+            prepared.append(data)
 
+    skipped += len(eligible) - len(inst_map)
     prepared.sort(key=lambda t: t["signal_time"])
     return prepared, skipped
 

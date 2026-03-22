@@ -64,7 +64,7 @@ async def fetch_stock_candles_raw(
     return pd.DataFrame()
 
 
-_UPSTOX_SEMAPHORE = asyncio.Semaphore(10)
+_UPSTOX_SEMAPHORE = asyncio.Semaphore(25)
 
 
 async def _fetch_single(

@@ -1,12 +1,19 @@
 """Phase 1: OI Analysis + Ranking + Market Context tagging.
 
-Optimised with concurrent async API calls — tick sub-batches and stock
-batches are fetched in parallel via asyncio.gather.
+Optimised with:
+  - Concurrent async API calls within each date (batches + tick sub-batches)
+  - Date-level parallelism — multiple trading dates processed concurrently
+
+Environment tuning (optional):
+  BACKTEST_DATE_CONCURRENCY — how many trading dates run at once (default 6, max 32).
+  TICKERFLOW_API_CONCURRENCY — max concurrent HTTP calls to TickerFlow (default 40);
+    raise both together when pushing throughput; watch for 429/OOM on the client or API.
 """
 
 import asyncio
 import json
 import logging
+import os
 import pickle
 import time
 
@@ -33,6 +40,32 @@ from src.backtest.data import tickerflow as tf
 logger = logging.getLogger("Phase1")
 
 
+def _date_concurrency_from_env() -> int:
+    """How many calendar dates to process concurrently in Phase 1."""
+    raw = os.getenv("BACKTEST_DATE_CONCURRENCY")
+    default = 6
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        n = int(str(raw).strip())
+    except ValueError:
+        logger.warning(
+            "Invalid BACKTEST_DATE_CONCURRENCY=%r, using default %d", raw, default,
+        )
+        return default
+    min_v, max_v = 1, 32
+    clamped = max(min_v, min(n, max_v))
+    if clamped != n:
+        logger.warning(
+            "BACKTEST_DATE_CONCURRENCY=%r out of range [%d, %d], using %d",
+            raw, min_v, max_v, clamped,
+        )
+    return clamped
+
+
+DATE_CONCURRENCY = _date_concurrency_from_env()
+
+
 async def _fetch_batch_ticks(
     seqs: list[int], trade_date: str, tick_sub_size: int = 20,
 ) -> list[pd.DataFrame]:
@@ -57,23 +90,139 @@ async def _fetch_batch_ticks(
     return frames
 
 
+async def _process_single_date(
+    trade_date: str,
+    stocks: list[Stock],
+    expiry_dates: list[str],
+    config: BacktestConfig,
+    analysis_svc: AnalysisService,
+    date_semaphore: asyncio.Semaphore,
+) -> dict:
+    """Process one trading date end-to-end: fetch data + analyze.
+
+    Returns {
+        "trade_date": str,
+        "results": list,
+        "market_ctx": dict | None,
+        "index_ctx": dict | None,
+    }
+    """
+    async with date_semaphore:
+        date_start = time.time()
+        expiry = pick_expiry(trade_date, expiry_dates)
+        logger.info(f"--- {trade_date} (expiry={expiry}) ---")
+
+        market_ctx_entry = None
+        index_ctx_entry = None
+        market_svc = MarketContextService()
+        if market_svc.is_enabled:
+            cutoff = config.signal_cutoff_time
+            idx_ctx = await market_svc.evaluate_market_context(trade_date, cutoff_time=cutoff)
+            primary = market_context_config.PRIMARY_INDEX
+            primary_trend = idx_ctx.get(primary)
+            market_ctx_entry = {
+                name: {"trend": ctx.trend, "confidence": ctx.confidence}
+                for name, ctx in idx_ctx.items()
+            }
+            index_ctx_entry = dict(idx_ctx)
+            logger.info(f"  {primary}: {primary_trend.trend if primary_trend else 'N/A'}")
+
+        batch_size = config.batch_size
+        date_results = []
+
+        batch_groups = []
+        for i in range(0, len(stocks), batch_size):
+            batch = stocks[i : i + batch_size]
+            stock_ids = [s.id for s in batch]
+            batch_groups.append((batch, stock_ids))
+
+        inst_tasks = [
+            tf.aget_instruments_batch(stock_ids=ids, expiry=expiry)
+            for _, ids in batch_groups
+        ]
+        inst_results = await asyncio.gather(*inst_tasks, return_exceptions=True)
+
+        tick_tasks = []
+        tick_task_indices = []
+        for idx, (inst_res, (batch, _)) in enumerate(zip(inst_results, batch_groups)):
+            if isinstance(inst_res, Exception):
+                logger.warning(f"  [{trade_date}] Instruments batch failed: {inst_res}")
+                continue
+            if inst_res.empty:
+                continue
+            seqs = inst_res["instrument_seq"].dropna().astype(int).tolist()
+            if not seqs:
+                continue
+            tick_tasks.append(_fetch_batch_ticks(seqs, trade_date))
+            tick_task_indices.append(idx)
+
+        tick_results = await asyncio.gather(*tick_tasks, return_exceptions=True)
+
+        tick_map: dict[int, list[pd.DataFrame]] = {}
+        for task_pos, batch_idx in enumerate(tick_task_indices):
+            res = tick_results[task_pos]
+            if isinstance(res, Exception):
+                logger.warning(f"  [{trade_date}] Tick fetch failed for batch {batch_idx}: {res}")
+                continue
+            tick_map[batch_idx] = res
+
+        for idx, (batch, _) in enumerate(batch_groups):
+            batch_num = idx + 1
+            total_batches = len(batch_groups)
+            instrument_df = inst_results[idx]
+            if isinstance(instrument_df, Exception) or instrument_df.empty:
+                continue
+
+            tick_frames = tick_map.get(idx, [])
+            if not tick_frames:
+                continue
+            ticker_df = pd.concat(tick_frames, ignore_index=True)
+
+            valid = 0
+            for stock in batch:
+                try:
+                    result = analyze_stock(stock, instrument_df, ticker_df, trade_date, analysis_svc)
+                    if result:
+                        date_results.append(result)
+                        valid += 1
+                except Exception as e:
+                    logger.error(f"  [{trade_date}] Error on {stock.name}: {e}")
+
+            logger.info(
+                f"  [{trade_date}] Batch {batch_num}/{total_batches}: "
+                f"{valid}/{len(batch)} stocks with signals"
+            )
+
+        logger.info(
+            f"  {trade_date} done: {len(date_results)} stocks "
+            f"({time.time() - date_start:.1f}s)"
+        )
+
+        return {
+            "trade_date": trade_date,
+            "results": date_results,
+            "market_ctx": market_ctx_entry,
+            "index_ctx": index_ctx_entry,
+        }
+
+
 async def run(config: BacktestConfig, run_dir, *, predictions=None):
     """Execute Phase 1 and return (all_results, predictions, market_ctx_log).
 
-    If *predictions* is already set (in-memory from a prior call) it is
-    returned as-is — this path only matters when the orchestrator passes
-    cached data.
+    Processes up to DATE_CONCURRENCY trading dates in parallel.
     """
     start = time.time()
 
     dates = config.trading_dates
     logger.info(f"Phase 1: {len(dates)} trading dates ({dates[0]} -> {dates[-1]})")
-
+    logger.info(f"Date-level parallelism: {DATE_CONCURRENCY} concurrent dates (BACKTEST_DATE_CONCURRENCY)")
+    logger.info(
+        "TickerFlow: %s | max concurrent HTTP requests: %d (TICKERFLOW_API_CONCURRENCY)",
+        tf._BASE_URL,
+        tf.get_api_concurrency_limit(),
+    )
     analysis_svc = AnalysisService()
     ranking_svc = OptionRankingService()
-    market_svc = MarketContextService()
-
-    logger.info(f"TickerFlow API: {tf._BASE_URL}")
 
     raw_stocks = await tf.aget_stocks()
     stocks = [
@@ -89,99 +238,38 @@ async def run(config: BacktestConfig, run_dir, *, predictions=None):
     expiry_dates = await tf.aget_expiries()
     logger.info(f"Loaded {len(stocks)} stocks, {len(expiry_dates)} expiry dates")
 
+    date_semaphore = asyncio.Semaphore(DATE_CONCURRENCY)
+
+    date_tasks = [
+        _process_single_date(
+            trade_date, stocks, expiry_dates, config, analysis_svc, date_semaphore,
+        )
+        for trade_date in dates
+    ]
+
+    date_outputs = await asyncio.gather(*date_tasks, return_exceptions=True)
+
     all_results = []
     market_ctx_log: dict = {}
     date_index_contexts: dict = {}
 
-    for trade_date in dates:
-        date_start = time.time()
-        expiry = pick_expiry(trade_date, expiry_dates)
-        logger.info(f"--- {trade_date} (expiry={expiry}) ---")
-
-        if market_svc.is_enabled:
-            cutoff = config.signal_cutoff_time
-            idx_ctx = await market_svc.evaluate_market_context(trade_date, cutoff_time=cutoff)
-            primary_trend = market_svc.get_trend(market_context_config.PRIMARY_INDEX)
-            market_ctx_log[trade_date] = {
-                name: {"trend": ctx.trend, "confidence": ctx.confidence}
-                for name, ctx in idx_ctx.items()
-            }
-            date_index_contexts[trade_date] = dict(idx_ctx)
-            logger.info(f"  {market_context_config.PRIMARY_INDEX}: {primary_trend}")
-
-        batch_size = config.batch_size
-        date_results = []
-
-        # --- Fetch instrument batches concurrently (all batches per date) ---
-        batch_groups = []
-        for i in range(0, len(stocks), batch_size):
-            batch = stocks[i : i + batch_size]
-            stock_ids = [s.id for s in batch]
-            batch_groups.append((batch, stock_ids))
-
-        inst_tasks = [
-            tf.aget_instruments_batch(stock_ids=ids, expiry=expiry)
-            for _, ids in batch_groups
-        ]
-        inst_results = await asyncio.gather(*inst_tasks, return_exceptions=True)
-
-        # --- For each batch that got instruments, fetch ticks concurrently ---
-        tick_tasks = []
-        tick_task_indices = []
-        for idx, (inst_res, (batch, _)) in enumerate(zip(inst_results, batch_groups)):
-            if isinstance(inst_res, Exception):
-                logger.warning(f"  Instruments batch failed: {inst_res}")
-                continue
-            if inst_res.empty:
-                continue
-            seqs = inst_res["instrument_seq"].dropna().astype(int).tolist()
-            if not seqs:
-                continue
-            tick_tasks.append(_fetch_batch_ticks(seqs, trade_date))
-            tick_task_indices.append(idx)
-
-        tick_results = await asyncio.gather(*tick_tasks, return_exceptions=True)
-
-        # --- Analyze stocks with fetched data ---
-        tick_map: dict[int, list[pd.DataFrame]] = {}
-        for task_pos, batch_idx in enumerate(tick_task_indices):
-            res = tick_results[task_pos]
-            if isinstance(res, Exception):
-                logger.warning(f"  Tick fetch failed for batch {batch_idx}: {res}")
-                continue
-            tick_map[batch_idx] = res
-
-        for idx, (batch, _) in enumerate(batch_groups):
-            batch_num = idx + 1
-            total_batches = len(batch_groups)
-            instrument_df = inst_results[idx]
-            if isinstance(instrument_df, Exception) or instrument_df.empty:
-                continue
-
-            tick_frames = tick_map.get(idx, [])
-            if not tick_frames:
-                logger.info(f"  Batch {batch_num}/{total_batches}: no ticker data")
-                continue
-            ticker_df = pd.concat(tick_frames, ignore_index=True)
-
-            valid = 0
-            for stock in batch:
-                try:
-                    result = analyze_stock(stock, instrument_df, ticker_df, trade_date, analysis_svc)
-                    if result:
-                        date_results.append(result)
-                        valid += 1
-                except Exception as e:
-                    logger.error(f"  Error on {stock.name}: {e}")
-
-            logger.info(f"  Batch {batch_num}/{total_batches}: {valid}/{len(batch)} stocks with signals")
-
-        all_results.extend(date_results)
-        logger.info(f"  {trade_date} done: {len(date_results)} stocks ({time.time() - date_start:.1f}s)")
+    for output in date_outputs:
+        if isinstance(output, Exception):
+            logger.error(f"  Date processing failed: {output}")
+            continue
+        all_results.extend(output["results"])
+        td = output["trade_date"]
+        if output["market_ctx"] is not None:
+            market_ctx_log[td] = output["market_ctx"]
+        if output["index_ctx"] is not None:
+            date_index_contexts[td] = output["index_ctx"]
 
     logger.info(f"Total analysis results: {len(all_results)} stocks across {len(dates)} dates")
 
     preds = ranking_svc.rank_options(all_results)
+
+    # Shared instance for post-ranking market tagging (per-stock index mapping)
+    market_svc = MarketContextService()
 
     if market_svc.is_enabled and date_index_contexts:
         call_preds = extract_preds(preds.call, "call")

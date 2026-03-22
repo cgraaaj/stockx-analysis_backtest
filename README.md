@@ -463,6 +463,8 @@ Grades are assigned based on the bullish percentage of OI strikes:
 |----------|----------|---------|---------|
 | `TICKERFLOW_URL` | Yes | `http://localhost:8000/api/v1` | `data/tickerflow.py` |
 | `TICKERFLOW_API_KEY` | Yes | `""` | `data/tickerflow.py` (X-API-KEY header) |
+| `TICKERFLOW_API_CONCURRENCY` | No | `40` | Max concurrent HTTP requests to TickerFlow (`data/tickerflow.py`); raise with care |
+| `BACKTEST_DATE_CONCURRENCY` | No | `6` | Phase 1: how many trading dates run in parallel (`phases/phase1_analysis.py`); max 32 |
 | `DB_USER` | For analysis module | -- | `db_config.py` |
 | `DB_PASSWORD` | For analysis module | -- | `db_config.py` (URL-encoded) |
 | `DB_HOST` | For analysis module | -- | `db_config.py` |
@@ -557,6 +559,8 @@ python -m src.backtest.cli --config single_day.json --date 2025-02-28
 
 ### Common CLI Commands
 
+See **[docs/run-examples.md](docs/run-examples.md)** for a full set of sample commands (single date, phases, resume, nohup).
+
 ```bash
 # Full pipeline (all 4 phases)
 python -m src.backtest.cli --config full_2025.json
@@ -577,6 +581,10 @@ python -m src.backtest.cli --config full_2025.json --phase 3a \
 # Multiple phases
 python -m src.backtest.cli --config full_2025.json --phase 3a,3b
 ```
+
+**Background runs (nohup):** use `./scripts/run_backtest_2025_nohup.sh` or `./scripts/run_backtest_q1_2026_nohup.sh` — see [scripts/README.md](scripts/README.md).
+
+**Release notes:** [RELEASE_NOTES.md](RELEASE_NOTES.md) is updated automatically on each push to `master` via [.github/workflows/update-release-notes.yml](.github/workflows/update-release-notes.yml). To update locally, run `./scripts/update-release-notes.sh`.
 
 ---
 

@@ -8,8 +8,9 @@ Async methods use a shared ``httpx.AsyncClient`` with connection pooling.
 Retry logic handles transient 429 / 502 / 503 with exponential backoff.
 
 Configuration is read from environment variables:
-    TICKERFLOW_URL      - base URL (e.g. https://tickerflow.cgraaaj.in/api/v1)
-    TICKERFLOW_API_KEY  - API key for X-API-KEY header
+    TICKERFLOW_URL              - base URL (e.g. https://tickerflow.cgraaaj.in/api/v1)
+    TICKERFLOW_API_KEY          - API key for X-API-KEY header
+    TICKERFLOW_API_CONCURRENCY  - max concurrent in-flight HTTP requests (default 40)
 """
 
 import asyncio
@@ -33,7 +34,34 @@ _TIMEOUT = 60
 _MAX_RETRIES = 3
 _IST = timezone(timedelta(hours=5, minutes=30))
 
-_API_SEMAPHORE = asyncio.Semaphore(15)
+
+def _env_int(name: str, default: int, *, min_v: int, max_v: int) -> int:
+    """Parse a positive int from env; clamp to [min_v, max_v]."""
+    raw = os.getenv(name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        n = int(str(raw).strip())
+    except ValueError:
+        logger.warning("Invalid %s=%r, using default %d", name, raw, default)
+        return default
+    clamped = max(min_v, min(n, max_v))
+    if clamped != n:
+        logger.warning(
+            "%s=%r out of range [%d, %d], using %d",
+            name, raw, min_v, max_v, clamped,
+        )
+    return clamped
+
+
+# Global cap on concurrent TickerFlow HTTP calls (all phases share this client).
+_API_CONCURRENCY = _env_int("TICKERFLOW_API_CONCURRENCY", 40, min_v=1, max_v=256)
+_API_SEMAPHORE = asyncio.Semaphore(_API_CONCURRENCY)
+
+
+def get_api_concurrency_limit() -> int:
+    """Effective max concurrent HTTP requests to TickerFlow (from env or default)."""
+    return _API_CONCURRENCY
 
 
 def _headers() -> dict[str, str]:
@@ -93,8 +121,8 @@ def _get_async_client() -> httpx.AsyncClient:
             headers=_headers(),
             timeout=_TIMEOUT,
             limits=httpx.Limits(
-                max_connections=30,
-                max_keepalive_connections=20,
+                max_connections=max(60, _API_CONCURRENCY + 20),
+                max_keepalive_connections=max(40, _API_CONCURRENCY),
             ),
         )
     return _async_client
@@ -115,6 +143,27 @@ async def _aget(path: str, params: dict | None = None) -> dict[str, Any]:
     async with _API_SEMAPHORE:
         for attempt in range(1, _MAX_RETRIES + 1):
             resp = await client.get(url, params=params)
+            if resp.status_code in (429, 502, 503) and attempt < _MAX_RETRIES:
+                wait = 2 ** attempt
+                logger.warning(
+                    "HTTP %d from %s, retrying in %ds (attempt %d/%d)",
+                    resp.status_code, path, wait, attempt, _MAX_RETRIES,
+                )
+                await asyncio.sleep(wait)
+                continue
+            resp.raise_for_status()
+            return resp.json()
+        resp.raise_for_status()
+        return resp.json()
+
+
+async def _apost(path: str, json_body: dict | None = None) -> dict[str, Any]:
+    """Async POST with retry + concurrency throttle."""
+    url = f"{_BASE_URL}/{path.lstrip('/')}"
+    client = _get_async_client()
+    async with _API_SEMAPHORE:
+        for attempt in range(1, _MAX_RETRIES + 1):
+            resp = await client.post(url, json=json_body)
             if resp.status_code in (429, 502, 503) and attempt < _MAX_RETRIES:
                 wait = 2 ** attempt
                 logger.warning(
@@ -476,3 +525,56 @@ async def afind_atm_instrument(
         "trading_symbol": r["trading_symbol"],
         "instrument_key": r.get("instrument_key"),
     }
+
+
+# ------------------------------------------------------------------
+# Bulk ATM instrument lookup (single API call for many trades)
+# ------------------------------------------------------------------
+
+async def aget_atm_instruments_bulk(
+    trade_requests: list[dict],
+    expiry: str | None = None,
+) -> dict[int, dict]:
+    """Find ATM instruments for many stock+type+strike pairs in one POST.
+
+    Args:
+        trade_requests: list of dicts, each with keys:
+            idx (int), stock_name (str), option_type (str: call/put),
+            spot_price (float)
+        expiry: optional expiry date string (YYYY-MM-DD)
+
+    Returns:
+        {idx: {"instrument_seq", "strike_price", "lot_size",
+               "trading_symbol", "instrument_key"}}
+    """
+    if not trade_requests:
+        return {}
+
+    body: dict[str, Any] = {
+        "requests": [
+            {
+                "stock_name": t["stock_name"],
+                "instrument_type": "CE" if t["option_type"] == "call" else "PE",
+                "nearest_strike": t["spot_price"],
+            }
+            for t in trade_requests
+        ],
+    }
+    if expiry:
+        body["expiry"] = expiry
+
+    data = await _apost("instruments/atm-bulk/", json_body=body)
+    rows = data.get("results", [])
+
+    result: dict[int, dict] = {}
+    for row in rows:
+        req_idx = row["_req_idx"]
+        original_idx = trade_requests[req_idx]["idx"]
+        result[original_idx] = {
+            "instrument_seq": row["instrument_seq"],
+            "strike_price": float(row["strike_price"]),
+            "lot_size": int(row["lot_size"]),
+            "trading_symbol": row["trading_symbol"],
+            "instrument_key": row.get("instrument_key"),
+        }
+    return result
