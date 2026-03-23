@@ -60,7 +60,7 @@ class StrategyConfig:
     VWAP_SL_BUFFER_PCT: float = 0.1     # buffer below/above VWAP for SL (0.1 = 0.1%)
 
     # Intraday hard exit
-    MAX_EXIT_TIME: str = "15:15:00"     # force exit before market close
+    MAX_EXIT_TIME: str = "14:00:00"     # force exit (aligned with analysis session end)
 
     # Support / Resistance (disabled by default)
     USE_SR_LEVELS: bool = False         # pivot-point S/R; enable later

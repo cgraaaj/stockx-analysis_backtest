@@ -40,6 +40,19 @@ from src.backtest.data import tickerflow as tf
 logger = logging.getLogger("Phase1")
 
 
+def _phase1_signal_cutoff(config: BacktestConfig) -> str | None:
+    """Return cutoff time string, or None to keep all signals (no filter_by_cutoff).
+
+    None and empty/whitespace disable the post-ranking clock filter so predictions
+    across the full analysis session (e.g. 10:05, 14:05) are retained.
+    """
+    c = config.signal_cutoff_time
+    if c is None:
+        return None
+    s = str(c).strip()
+    return s or None
+
+
 def _date_concurrency_from_env() -> int:
     """How many calendar dates to process concurrently in Phase 1."""
     raw = os.getenv("BACKTEST_DATE_CONCURRENCY")
@@ -116,7 +129,7 @@ async def _process_single_date(
         index_ctx_entry = None
         market_svc = MarketContextService()
         if market_svc.is_enabled:
-            cutoff = config.signal_cutoff_time
+            cutoff = _phase1_signal_cutoff(config)
             idx_ctx = await market_svc.evaluate_market_context(trade_date, cutoff_time=cutoff)
             primary = market_context_config.PRIMARY_INDEX
             primary_trend = idx_ctx.get(primary)
@@ -284,10 +297,14 @@ async def run(config: BacktestConfig, run_dir, *, predictions=None):
         preds.call = rebuild_entries(filtered_calls, preds.call)
         preds.put = rebuild_entries(filtered_puts, preds.put)
 
-    cutoff_time = config.signal_cutoff_time
+    cutoff_time = _phase1_signal_cutoff(config)
     if cutoff_time:
         preds.call = filter_by_cutoff(preds.call, cutoff_time)
         preds.put = filter_by_cutoff(preds.put, cutoff_time)
+    else:
+        logger.info(
+            "signal_cutoff_time unset — skipping filter_by_cutoff (all in-session signals kept)"
+        )
 
     # -- persist outputs --
     export = ExportView()

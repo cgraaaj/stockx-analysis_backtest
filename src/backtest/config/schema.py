@@ -15,7 +15,9 @@ class BacktestConfig:
 
     # Strategy (Phase 1+2) - optional with defaults
     description: str = ""
-    signal_cutoff_time: str = "09:45:00"
+    # None or "" = no Phase 1 time filter (keep all signals within analysis hours).
+    # Set "HH:MM:SS" to drop predictions after that clock time on each date.
+    signal_cutoff_time: str | None = None
     batch_size: int = 10
     reward_ratio: float = 3.0
     sl_method: str = "percentage"
@@ -23,7 +25,7 @@ class BacktestConfig:
     max_holding_candles: int = 24
     entry_candle_offset: int = 1
     use_vwap_bias: bool = True
-    max_exit_time: str = "15:15:00"
+    max_exit_time: str = "14:00:00"
 
     # Analysis
     oi_weight_blend: float = 1.0

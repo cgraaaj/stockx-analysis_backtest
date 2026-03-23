@@ -4,6 +4,9 @@ Analysis Service
 Core option analysis business logic: OI action classification, trend analysis,
 grading, and prediction ranking.
 
+Reads ``analysis_config`` / ``trading_config`` at call time (never cached at
+module import) so backtest ``apply_to_globals()`` overrides apply correctly.
+
 All vectorized operations are preserved from the original optimized code.
 The only structural change is that CE/PE pairs are now identified by
 instrument_seq (integer) instead of UUID, matching the ticker_ts schema.
@@ -25,13 +28,6 @@ from ..models.entities import (
     StockPrediction, OptionAnalysis, TimeAnalysisData,
     TrendAnalysisResult, CEPEPair, PredictionResult,
 )
-
-
-# NOTE: Do NOT cache analysis_config values at module level.
-# Backtest scripts mutate the config singletons after import, so
-# reading them here would produce stale values.
-# Use analysis_config.USE_OI_MAGNITUDE_WEIGHTING / .OI_WEIGHT_BLEND
-# directly where needed.
 
 
 class AnalysisService:

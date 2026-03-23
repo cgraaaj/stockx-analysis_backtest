@@ -28,6 +28,7 @@ src/backtest/2026/results/
 # Working copies / scratch
 new_changes/
 memory/
+oldcode/
 
 # OS / IDE
 .DS_Store
