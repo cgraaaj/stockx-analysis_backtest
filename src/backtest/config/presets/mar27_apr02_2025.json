@@ -1,0 +1,13 @@
+{
+    "name": "mar27_apr02_2025",
+    "description": "2025-03-27 through 2025-04-02",
+    "trading_dates": [
+      "2025-03-27",
+      "2025-03-28",
+      "2025-03-31",
+      "2025-04-01",
+      "2025-04-02"
+    ],
+    "signal_cutoff_time": null,
+    "batch_size": 10
+  }
